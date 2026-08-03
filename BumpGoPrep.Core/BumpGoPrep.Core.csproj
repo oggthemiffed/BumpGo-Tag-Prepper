@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>BumpGoPrep.Core</RootNamespace>
+    <AssemblyName>BumpGoPrep.Core</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- PC/SC wrapper for talking to the NFC reader -->
+    <PackageReference Include="PCSC" Version="6.2.0" />
+    <PackageReference Include="PCSC.Iso7816" Version="6.2.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Tests drive the internal command building and the ITagTransport seam. -->
+    <InternalsVisibleTo Include="BumpGoPrep.Tests" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,16 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "BumpGoPrep.Console (Debug)",
+            "type": "coreclr",
+            "request": "launch",
+            "preLaunchTask": "build",
+            "program": "${workspaceFolder}/BumpGoPrep.Console/bin/Debug/net10.0/BumpGoPrep.Console.dll",
+            "args": [],
+            "cwd": "${workspaceFolder}/BumpGoPrep.Console",
+            "console": "integratedTerminal",
+            "stopAtEntry": false
+        }
+    ]
+}
