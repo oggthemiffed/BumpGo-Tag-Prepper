@@ -85,6 +85,10 @@ Clone tags whose UID doesn't begin with `04` (NXP's manufacturer code) have been
 
 The two-page procedure this automates was worked out and shared by the RC community — credit to `versvendet33` and others in that thread for establishing that writing the password is all a blank tag needs.
 
+## License
+
+[MIT](LICENSE) — do what you like with it, no warranty.
+
 ## Disclaimer
 
 Not affiliated with, endorsed by, or supported by SkyRC. BumpGo and D200neo+ are trademarks of their respective owners. This writes to NFC tags you own, at your own risk.
