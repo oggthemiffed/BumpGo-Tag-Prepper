@@ -21,6 +21,39 @@ internal static class NfcCommands
 
     public static readonly byte[] PackValue = { 0x00, 0x00, 0x00, 0x00 };
 
+    /// <summary>First page of NTAG213 user memory, where the charger keeps its profile.</summary>
+    public const byte UserFirstPage = 0x04;
+
+    /// <summary>Last page of NTAG213 user memory.</summary>
+    public const byte UserLastPage = 0x27;
+
+    /// <summary>Dynamic lock bytes. Setting these is permanent, so they are never written.</summary>
+    public const byte DynamicLockPage = 0x28;
+
+    /// <summary>CFG0: MIRROR, RFUI, MIRROR_PAGE, AUTH0.</summary>
+    public const byte Config0Page = 0x29;
+
+    /// <summary>CFG1: ACCESS, RFUI, RFUI, RFUI.</summary>
+    public const byte Config1Page = 0x2A;
+
+    /// <summary>Highest page that returns real data on a read (PWD and PACK read back as zeros).</summary>
+    public const byte LastReadablePage = Config1Page;
+
+    /// <summary>Byte index of AUTH0 within CFG0: the first page that needs the password.</summary>
+    public const int Auth0Index = 3;
+
+    /// <summary>ACCESS bit 7: when set, reads (not just writes) need the password.</summary>
+    public const byte AccessProtBit = 0x80;
+
+    /// <summary>ACCESS bit 6: permanently locks the configuration pages. Never written by this app.</summary>
+    public const byte AccessCfgLckBit = 0x40;
+
+    /// <summary>
+    /// ACCESS bits 2-0 (AUTHLIM): a non-zero limit permanently disables the
+    /// password after that many failed attempts. Never written by this app.
+    /// </summary>
+    public const byte AccessAuthLimMask = 0x07;
+
     /// <summary>ACR122U "Get UID" pseudo-APDU.</summary>
     public static readonly byte[] GetUid = { 0xFF, 0xCA, 0x00, 0x00, 0x00 };
 
@@ -59,6 +92,46 @@ internal static class NfcCommands
         apdu[4] = 0x04;
         Array.Copy(fourBytes, 0, apdu, 5, 4);
         return apdu;
+    }
+
+    /// <summary>
+    /// Builds an NTAG PWD_AUTH (1B) wrapped in a PN532 InCommunicateThru
+    /// frame, sent through the ACR122U's Direct Transmit pseudo-APDU:
+    /// FF 00 00 00 07 D4 42 1B &lt;4-byte password&gt;.
+    /// </summary>
+    /// <remarks>
+    /// The reader has no built-in equivalent of PWD_AUTH, so this is the one
+    /// place the app speaks raw NTAG commands. The PN532 adds the CRC itself.
+    /// </remarks>
+    public static byte[] BuildPasswordAuth(byte[] password)
+    {
+        if (password.Length != 4)
+            throw new ArgumentException("NTAG passwords are 4 bytes.", nameof(password));
+
+        var apdu = new byte[] { 0xFF, 0x00, 0x00, 0x00, 0x07, 0xD4, 0x42, 0x1B, 0, 0, 0, 0 };
+        Array.Copy(password, 0, apdu, 8, 4);
+        return apdu;
+    }
+
+    /// <summary>
+    /// Interprets the reply to <see cref="BuildPasswordAuth"/>. On success the
+    /// tag answers with its 2-byte PACK, framed as D5 43 00 &lt;PACK&gt; 90 00.
+    /// A wrong password makes the tag NAK, which the PN532 reports as a
+    /// non-zero status byte (or a reply with no PACK).
+    /// </summary>
+    public static bool TryParsePasswordAuth(byte[] response, out byte[] pack)
+    {
+        pack = Array.Empty<byte>();
+
+        if (!IsSuccess(response))
+            return false;
+
+        var body = StripStatusWord(response);
+        if (body.Length < 5 || body[0] != 0xD5 || body[1] != 0x43 || body[2] != 0x00)
+            return false;
+
+        pack = body[3..5];
+        return true;
     }
 
     /// <summary>

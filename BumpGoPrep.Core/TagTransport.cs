@@ -17,6 +17,14 @@ internal interface ITagTransport : IDisposable
     /// error), as opposed to the tag replying with a failure status.
     /// </summary>
     bool TryTransmit(byte[] apdu, out byte[] response);
+
+    /// <summary>
+    /// Re-activates the tag (RF reset and re-select). Needed after the tag has
+    /// NAK'd a command, e.g. a read of a password-protected page, because an
+    /// NTAG drops back to its idle state on a NAK and ignores everything until
+    /// it is selected again.
+    /// </summary>
+    bool TryReset();
 }
 
 /// <summary>Talks to a real tag over PC/SC. Owns the reader it wraps.</summary>
@@ -51,6 +59,19 @@ internal sealed class ScardTransport : ITagTransport
         }
 
         return true;
+    }
+
+    public bool TryReset()
+    {
+        try
+        {
+            return _reader.Reconnect(SCardShareMode.Shared, SCardProtocol.Any,
+                SCardReaderDisposition.Reset) == SCardError.Success;
+        }
+        catch (PCSCException)
+        {
+            return false;
+        }
     }
 
     public void Dispose()

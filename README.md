@@ -15,7 +15,42 @@ A blank NTAG213 needs just two pages written before the charger will recognise i
 
 That's it — no dumping or cloning of an original tag required.
 
-It writes only those two pages, and deliberately never touches the configuration pages (`0x29` AUTH0 / `0x2A` ACCESS), so it cannot accidentally lock a tag.
+In prep mode it writes only those two pages, and never touches the configuration pages (`0x29` AUTH0 / `0x2A` ACCESS), so it cannot accidentally lock a tag.
+
+## Programming tags without the charger
+
+Prepping leaves the profile to the charger. The app can also copy a whole profile from the PC, so you can make a batch of identical tags (say, ten 2S LiPo tags) without bumping each one on the charger:
+
+1. **Make a master tag on the charger.** Prep a blank tag, bump it, set the profile and choose *Save to BumpGo Tag*.
+2. **Dump it:** `dotnet run --project BumpGoPrep.Console -- dump`, then put the master tag on the reader. Its memory is saved to `dumps/<UID>_<time>.txt`.
+3. **Program the blanks from that dump:** `dotnet run --project BumpGoPrep.Console -- program dumps/<file>.txt`. Each tag gets the password and PACK, then the 36 user-memory pages (`0x04`–`0x27`) copied across and read back to verify.
+4. **Bump a programmed tag on the charger** and check that it shows the parameters you saved on the master tag.
+
+> **Not yet proven on hardware.** The BumpGo data format isn't documented. If the charger ties the profile to the tag's UID (with a checksum, say), a copied profile will be rejected, and that will show up at step 4. If it is rejected, try `--with-protection` (below) before giving up.
+
+### `--with-protection`
+
+When the charger saves a profile it normally password-protects the tag by setting AUTH0 (and possibly the PROT bit in ACCESS). The dump shows what it set, as `# AUTH0` / `# ACCESS` lines at the top. By default `program` leaves the copies unprotected. If the charger appears to care, add `--with-protection` to copy AUTH0 and ACCESS from the dump as well.
+
+Protection uses the BumpGo password, which the app already knows, so it can always be undone. The ACCESS bits that *can't* be undone are never written: `CFGLCK` (locks the config pages permanently) and `AUTHLIM` (disables the tag after too many wrong passwords). If the dump has them set, they are cleared and a note is printed.
+
+Tags the charger has already protected can be dumped, re-prepped and re-programmed: the app authenticates with the BumpGo password when it finds AUTH0 set or a page it can't read.
+
+### Decoding the profile format
+
+To see which bytes hold which setting, save profiles on the charger that differ in one setting only, dump each tag, and compare them:
+
+```bash
+dotnet run --project BumpGoPrep.Console -- diff dumps/lipo-2s.txt dumps/lipo-4s.txt dumps/lihv-4s.txt
+```
+
+```
+page  [1]          [2]          [3]
+ 04   01 02 05 00  01 04 05 00  02 04 05 00   user
+      ^^ ^^
+```
+
+Only differing pages are listed, with `^^` under the bytes that changed. Dump files are plain text and safe to edit by hand: lines are `PP: B0 B1 B2 B3`, and anything after the four bytes is ignored. Once the layout is known, a profile could be generated from settings directly instead of copied.
 
 ## Requirements
 
@@ -31,7 +66,7 @@ dotnet build
 dotnet run --project BumpGoPrep.Console
 ```
 
-Place a blank tag on the reader. It preps automatically, then waits for the next one:
+With no arguments it runs in prep mode. Place a blank tag on the reader. It preps automatically, then waits for the next one:
 
 ```
 BumpGo Tag Prepper
@@ -47,7 +82,16 @@ Ready - place a blank NTAG213 on the reader. Ctrl+C to quit.
     prepped - 1 done. Remove the tag and place the next one.
 ```
 
-Each tag is prepped once. Lift a tag off and place it back to run it again, which is also how you retry one that failed. `Ctrl+C` stops cleanly and prints a summary.
+Each tag is processed once. Lift a tag off and place it back to run it again, which is also how you retry one that failed. `Ctrl+C` stops cleanly and prints a summary.
+
+### Commands
+
+| Command | What it does |
+| ------- | ------------ |
+| `prep` (default) | Writes the password and PACK so the charger accepts the tag as a new BumpGo tag |
+| `dump [--out <folder>]` | Reads each tag and saves it to a text file. Writes nothing |
+| `program <dump-file> [--with-protection]` | Preps each tag, copies the profile from the dump, and verifies it |
+| `diff <file> <file> [...]` | Shows which bytes differ between dumps. No reader needed |
 
 ## Project layout
 
@@ -76,6 +120,8 @@ FF D6 00 <page> 04 <4 bytes>
 ```
 
 The reader handles the NfcA framing, the CRC and the tag's ACK internally. Raw NTAG `WRITE` (`A2`) commands work too, but must be wrapped in a PN532 Direct Transmit frame (`FF 00 00 00 <Lc> D4 40 01 …`) and unwrapped again on the way back — the built-in command avoids all of that.
+
+Password authentication (`PWD_AUTH`, `1B`) has no built-in reader command, so it is the one raw NTAG command, sent via the ACR122U's Direct Transmit as a PN532 `InCommunicateThru` (`FF 00 00 00 07 D4 42 1B <pwd>`). A tag that refuses a command (wrong password, protected page) drops to idle and ignores everything until it is re-selected, so after a refused read the app reconnects with a card reset before authenticating.
 
 Worth knowing if you extend this: **every reply ends with a two-byte status word**, `90 00` meaning success. A successful write returns *only* that status word and no data. Mistaking those trailing bytes for tag data is an easy way to convince yourself that working writes are failing.
 
