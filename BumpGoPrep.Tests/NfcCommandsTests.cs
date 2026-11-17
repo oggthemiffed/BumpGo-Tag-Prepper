@@ -85,3 +85,35 @@ public class NfcCommandsTests
         Assert.Equal(uid, NfcCommands.StripStatusWord(response));
     }
 }
+
+public class PasswordAuthCommandTests
+{
+    [Fact]
+    public void BuildPasswordAuth_wraps_pwd_auth_in_a_direct_transmit()
+    {
+        var apdu = NfcCommands.BuildPasswordAuth(NfcCommands.PasswordValue);
+
+        Assert.Equal(
+            new byte[] { 0xFF, 0x00, 0x00, 0x00, 0x07, 0xD4, 0x42, 0x1B, 0x05, 0x07, 0x09, 0x03 },
+            apdu);
+    }
+
+    [Fact]
+    public void A_successful_auth_returns_the_pack()
+    {
+        var ok = NfcCommands.TryParsePasswordAuth(new byte[] { 0xD5, 0x43, 0x00, 0x12, 0x34, 0x90, 0x00 }, out var pack);
+
+        Assert.True(ok);
+        Assert.Equal(new byte[] { 0x12, 0x34 }, pack);
+    }
+
+    [Theory]
+    [InlineData(new byte[] { 0xD5, 0x43, 0x01, 0x90, 0x00 })]       // tag NAK'd (wrong password)
+    [InlineData(new byte[] { 0xD5, 0x43, 0x00, 0x90, 0x00 })]       // no PACK in the reply
+    [InlineData(new byte[] { 0x63, 0x00 })]                         // reader error
+    [InlineData(new byte[] { 0xD5, 0x41, 0x00, 0x00, 0x00, 0x90, 0x00 })] // wrong PN532 response code
+    public void Anything_else_is_a_failed_auth(byte[] response)
+    {
+        Assert.False(NfcCommands.TryParsePasswordAuth(response, out _));
+    }
+}

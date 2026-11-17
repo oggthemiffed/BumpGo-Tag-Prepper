@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using BumpGoPrep.Core;
 
 namespace BumpGoPrep.Tests;
@@ -9,8 +8,6 @@ namespace BumpGoPrep.Tests;
 /// </summary>
 public class BumpGoTagPrepperServiceTests
 {
-    private const string ReaderName = "TEST READER";
-
     [Fact]
     public void A_healthy_tag_gets_the_password_then_the_pack()
     {
@@ -171,72 +168,5 @@ public class BumpGoTagPrepperServiceTests
 
         Assert.True(harness.WaitForPrepCount(1));
         Assert.True(harness.WaitFor(() => tag.DisposeCount >= 2));
-    }
-
-    /// <summary>Runs a service against a fake reader and records what it reports.</summary>
-    private sealed class Harness : IDisposable
-    {
-        private readonly BumpGoTagPrepperService _service;
-        private readonly object _gate = new();
-        private readonly List<string?> _detected = new();
-        private readonly List<string?> _removed = new();
-        private readonly List<bool> _prepped = new();
-        private readonly List<string> _steps = new();
-        private readonly List<string> _logs = new();
-
-        private Harness(Func<string, ITagTransport?> connect)
-        {
-            _service = new BumpGoTagPrepperService(connect);
-
-            _service.TagDetected += (_, e) => Record(_detected, e.Uid);
-            _service.TagRemoved += (_, e) => Record(_removed, e.Uid);
-            _service.TagPrepped += (_, e) => Record(_prepped, e.Success);
-            _service.Log += (_, e) => Record(_logs, e.Message);
-            _service.StepCompleted += (_, e) =>
-                Record(_steps, $"{e.StepLabel}: {(e.Success ? "OK" : "FAILED")}");
-        }
-
-        public static Harness Watching(Func<string, ITagTransport?> connect)
-        {
-            var harness = new Harness(connect);
-            harness._service.StartWatching(ReaderName);
-            return harness;
-        }
-
-        public int PreppedCount => _service.PreppedCount;
-
-        public IReadOnlyList<string?> Detected() => Snapshot(_detected);
-        public IReadOnlyList<string?> Removed() => Snapshot(_removed);
-        public IReadOnlyList<bool> PrepResults() => Snapshot(_prepped);
-        public IReadOnlyList<string> Steps() => Snapshot(_steps);
-        public IReadOnlyList<string> Logs() => Snapshot(_logs);
-
-        /// <summary>Waits for at least <paramref name="count"/> successful preps.</summary>
-        public bool WaitForPrepCount(int count) =>
-            WaitFor(() => PrepResults().Count(success => success) >= count);
-
-        public bool WaitFor(Func<bool> condition, int timeoutMs = 10_000)
-        {
-            var stopwatch = Stopwatch.StartNew();
-            while (stopwatch.ElapsedMilliseconds < timeoutMs)
-            {
-                if (condition()) return true;
-                Thread.Sleep(20);
-            }
-
-            return condition();
-        }
-
-        private void Record<T>(List<T> into, T value)
-        {
-            lock (_gate) into.Add(value);
-        }
-
-        private IReadOnlyList<T> Snapshot<T>(List<T> from)
-        {
-            lock (_gate) return from.ToArray();
-        }
-
-        public void Dispose() => _service.Dispose();
     }
 }

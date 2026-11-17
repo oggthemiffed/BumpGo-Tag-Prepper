@@ -43,10 +43,32 @@ public sealed class BumpGoTagPrepperService : IDisposable
     /// <summary>Raised once a tag has been fully processed.</summary>
     public event EventHandler<TagPreppedEventArgs>? TagPrepped;
 
+    /// <summary>Raised in <see cref="TagMode.Dump"/> with everything read off the tag.</summary>
+    public event EventHandler<TagReadEventArgs>? TagRead;
+
     /// <summary>General free-text status/log messages.</summary>
     public event EventHandler<LogEventArgs>? Log;
 
+    /// <summary>Number of tags successfully processed in the current mode.</summary>
     public int PreppedCount => _preppedCount;
+
+    /// <summary>What to do with each tag. Set before <see cref="StartWatching"/>.</summary>
+    public TagMode Mode { get; set; } = TagMode.Prep;
+
+    /// <summary>
+    /// The tag image whose user-memory pages are copied onto each tag in
+    /// <see cref="TagMode.Program"/>. Typically a dump of a tag the charger
+    /// has already saved a profile to.
+    /// </summary>
+    public TagImage? Template { get; set; }
+
+    /// <summary>
+    /// In <see cref="TagMode.Program"/>, also copy the template's AUTH0 and
+    /// ACCESS settings, so the copy is password-protected the same way the
+    /// charger protected the original. Off by default. The config-lock and
+    /// failed-attempt-limit bits are never copied, so a tag can't be bricked.
+    /// </summary>
+    public bool CopyProtectionConfig { get; set; }
 
     public BumpGoTagPrepperService()
     {
@@ -88,6 +110,15 @@ public sealed class BumpGoTagPrepperService : IDisposable
         {
             RaiseLog("Already watching a reader.");
             return;
+        }
+
+        if (Mode == TagMode.Program)
+        {
+            if (Template is null)
+                throw new InvalidOperationException("Program mode needs a Template.");
+            if (!Template.UserPages.Any())
+                throw new InvalidOperationException(
+                    "The template holds no user-memory pages (0x04-0x27), so there is nothing to program.");
         }
 
         _cts = new CancellationTokenSource();
@@ -139,7 +170,7 @@ public sealed class BumpGoTagPrepperService : IDisposable
 
             WarnIfUnexpectedTagType(transport!);
 
-            var success = PrepOneTag(transport!);
+            var success = ProcessTag(transport!, uid);
             if (success)
             {
                 Interlocked.Increment(ref _preppedCount);
@@ -153,19 +184,278 @@ public sealed class BumpGoTagPrepperService : IDisposable
         RaiseLog("Stopped watching.");
     }
 
-    private bool PrepOneTag(ITagTransport transport)
+    private bool ProcessTag(ITagTransport transport, string uid)
     {
-        var ok = WritePage(transport, NfcCommands.PasswordPage, NfcCommands.PasswordValue,
+        var session = new TagSession(transport);
+
+        return Mode switch
+        {
+            TagMode.Dump => DumpTag(session, uid),
+            TagMode.Program => ProgramTag(session),
+            _ => EnsureWriteAccess(session) && PrepOneTag(session),
+        };
+    }
+
+    private bool PrepOneTag(TagSession session)
+    {
+        var ok = WritePage(session, NfcCommands.PasswordPage, NfcCommands.PasswordValue,
             "Password (page 43)");
         if (!ok) return false;
 
-        return WritePage(transport, NfcCommands.PackPage, NfcCommands.PackValue,
+        return WritePage(session, NfcCommands.PackPage, NfcCommands.PackValue,
             "PACK (page 44)");
     }
 
-    private bool WritePage(ITagTransport transport, byte page, byte[] value, string label)
+    private bool DumpTag(TagSession session, string uid)
+    {
+        var image = ReadImage(session, uid);
+        if (image is null)
+        {
+            StepCompleted?.Invoke(this, new TagStepEventArgs("Read tag", false,
+                "could not read every page - hold the tag still and try again"));
+            return false;
+        }
+
+        StepCompleted?.Invoke(this, new TagStepEventArgs("Read tag", true,
+            $"{image.PageNumbers.Count} pages"));
+        TagRead?.Invoke(this, new TagReadEventArgs(uid, image));
+        return true;
+    }
+
+    private bool ProgramTag(TagSession session)
+    {
+        var template = Template!;
+
+        if (!EnsureWriteAccess(session)) return false;
+
+        WarnIfCapabilityContainerDiffers(session, template);
+
+        if (!PrepOneTag(session)) return false;
+        if (!WriteProfile(session, template)) return false;
+        if (!VerifyProfile(session, template)) return false;
+
+        return !CopyProtectionConfig || WriteProtectionConfig(session, template);
+    }
+
+    /// <summary>
+    /// Makes sure the tag will accept writes. A blank or prepped tag is open,
+    /// but one the charger has already used is normally password-protected,
+    /// so authenticate with the BumpGo password when AUTH0 says so (or when
+    /// the configuration pages can't even be read).
+    /// </summary>
+    private bool EnsureWriteAccess(TagSession session)
+    {
+        var config = ReadWithAuth(session, NfcCommands.Config0Page);
+        if (config is null)
+        {
+            StepCompleted?.Invoke(this, new TagStepEventArgs("Read config", false,
+                "could not read the tag's configuration pages"));
+            return false;
+        }
+
+        if (session.Authenticated) return true;
+
+        // A full read from page 0x29 covers CFG0, CFG1, PWD and PACK. Anything
+        // shorter isn't a normal reader reply; with nothing to go on, assume
+        // the tag is open and let the writes themselves report any problem.
+        if (config.Length < 8) return true;
+
+        var auth0 = config[NfcCommands.Auth0Index];
+        if (auth0 > NfcCommands.PackPage) return true;
+
+        RaiseLog($"Tag is password-protected from page 0x{auth0:X2}; authenticating with the BumpGo password.");
+        return Authenticate(session);
+    }
+
+    private bool Authenticate(TagSession session)
+    {
+        var ok = session.Transport.TryTransmit(NfcCommands.BuildPasswordAuth(NfcCommands.PasswordValue),
+                     out var response)
+                 && NfcCommands.TryParsePasswordAuth(response, out var pack);
+
+        session.Authenticated = ok;
+
+        var detail = ok
+            ? "accepted"
+            : "the tag rejected the BumpGo password (it may belong to something else)";
+        StepCompleted?.Invoke(this, new TagStepEventArgs("Password auth", ok, detail));
+        return ok;
+    }
+
+    /// <summary>Reads pages 0x00-0x2A. PWD and PACK always read back as zeros, so they are skipped.</summary>
+    private TagImage? ReadImage(TagSession session, string uid)
+    {
+        var image = new TagImage(uid);
+
+        for (var page = 0; page <= NfcCommands.LastReadablePage; page += 4)
+        {
+            var data = ReadWithAuth(session, (byte)page);
+            if (data is null || data.Length < 16) return null;
+
+            for (var i = 0; i < 4 && page + i <= NfcCommands.LastReadablePage; i++)
+                image.SetPage((byte)(page + i), data[(i * 4)..(i * 4 + 4)]);
+        }
+
+        return image;
+    }
+
+    /// <summary>
+    /// Reads four pages starting at <paramref name="page"/>. If the tag refuses,
+    /// it is most likely read-protected: re-select it, authenticate, and try once more.
+    /// </summary>
+    private byte[]? ReadWithAuth(TagSession session, byte page)
+    {
+        var data = ReadFourPages(session.Transport, page);
+        if (data is not null || session.Authenticated) return data;
+
+        RaiseLog($"Page 0x{page:X2} can't be read without the password; authenticating.");
+
+        if (!session.Transport.TryReset())
+        {
+            StepCompleted?.Invoke(this, new TagStepEventArgs("Re-select tag", false,
+                "the reader could not re-select the tag"));
+            return null;
+        }
+
+        return Authenticate(session) ? ReadFourPages(session.Transport, page) : null;
+    }
+
+    /// <summary>One Read Binary of 16 bytes (four pages). Null if the tag or reader refused.</summary>
+    private static byte[]? ReadFourPages(ITagTransport transport, byte page)
+    {
+        var apdu = NfcCommands.BuildReadBinary(page, 16);
+        if (!transport.TryTransmit(apdu, out var response) || !NfcCommands.IsSuccess(response))
+            return null;
+
+        return NfcCommands.StripStatusWord(response);
+    }
+
+    private bool WriteProfile(TagSession session, TagImage template)
+    {
+        var pages = template.UserPages.ToArray();
+
+        foreach (var page in pages)
+        {
+            if (!TryWritePage(session.Transport, page, template[page]!, out var detail))
+            {
+                StepCompleted?.Invoke(this, new TagStepEventArgs("Profile data", false,
+                    $"page 0x{page:X2}: {detail}"));
+                return false;
+            }
+        }
+
+        StepCompleted?.Invoke(this, new TagStepEventArgs("Profile data", true,
+            $"{pages.Length} pages written"));
+        return true;
+    }
+
+    private bool VerifyProfile(TagSession session, TagImage template)
+    {
+        for (var start = NfcCommands.UserFirstPage; start <= NfcCommands.UserLastPage; start += 4)
+        {
+            var data = ReadWithAuth(session, (byte)start);
+            if (data is null || data.Length < 16)
+            {
+                StepCompleted?.Invoke(this, new TagStepEventArgs("Verify", false,
+                    $"could not read back page 0x{start:X2}"));
+                return false;
+            }
+
+            for (var i = 0; i < 4; i++)
+            {
+                var page = (byte)(start + i);
+                var expected = template[page];
+                if (expected is null || page > NfcCommands.UserLastPage) continue;
+
+                var actual = data[(i * 4)..(i * 4 + 4)];
+                if (!actual.SequenceEqual(expected))
+                {
+                    StepCompleted?.Invoke(this, new TagStepEventArgs("Verify", false,
+                        $"page 0x{page:X2} reads back as {BitConverter.ToString(actual)}, " +
+                        $"expected {BitConverter.ToString(expected)}"));
+                    return false;
+                }
+            }
+        }
+
+        StepCompleted?.Invoke(this, new TagStepEventArgs("Verify", true, "profile reads back correctly"));
+        return true;
+    }
+
+    /// <summary>
+    /// Copies AUTH0 and ACCESS from the template. ACCESS goes first: once AUTH0
+    /// is written the protection is live, and further writes would need the
+    /// password. The CFGLCK and AUTHLIM bits are stripped - one makes the
+    /// configuration permanent, the other can permanently disable the tag
+    /// after failed password attempts.
+    /// </summary>
+    private bool WriteProtectionConfig(TagSession session, TagImage template)
+    {
+        const string label = "Protection config";
+
+        var cfg0 = template[NfcCommands.Config0Page];
+        var cfg1 = template[NfcCommands.Config1Page];
+        if (cfg0 is null || cfg1 is null)
+        {
+            StepCompleted?.Invoke(this, new TagStepEventArgs(label, false,
+                "the template has no CFG0/CFG1 pages to copy"));
+            return false;
+        }
+
+        cfg1 = (byte[])cfg1.Clone();
+        const byte unsafeBits = NfcCommands.AccessCfgLckBit | NfcCommands.AccessAuthLimMask;
+        if ((cfg1[0] & unsafeBits) != 0)
+        {
+            RaiseLog($"Template ACCESS 0x{cfg1[0]:X2} has lock/attempt-limit bits set; " +
+                     $"writing 0x{cfg1[0] & ~unsafeBits:X2} instead so the tag stays changeable.");
+            cfg1[0] = (byte)(cfg1[0] & ~unsafeBits);
+        }
+
+        if (!TryWritePage(session.Transport, NfcCommands.Config1Page, cfg1, out var detail) ||
+            !TryWritePage(session.Transport, NfcCommands.Config0Page, cfg0, out detail))
+        {
+            StepCompleted?.Invoke(this, new TagStepEventArgs(label, false, detail));
+            return false;
+        }
+
+        StepCompleted?.Invoke(this, new TagStepEventArgs(label, true,
+            $"AUTH0 0x{cfg0[NfcCommands.Auth0Index]:X2}, ACCESS 0x{cfg1[0]:X2}"));
+        return true;
+    }
+
+    /// <summary>
+    /// The capability container is one-time-programmable, so it is never
+    /// written. If it doesn't match the template, say so: it is a likely
+    /// culprit if the charger rejects a programmed tag.
+    /// </summary>
+    private void WarnIfCapabilityContainerDiffers(TagSession session, TagImage template)
+    {
+        var expected = template[NfcCommands.CapabilityContainerPage];
+        if (expected is null) return;
+
+        var data = ReadFourPages(session.Transport, 0x00);
+        if (data is null || data.Length < 16) return;
+
+        var actual = data[12..16];
+        if (!actual.SequenceEqual(expected))
+        {
+            RaiseLog($"Note: this tag's capability container ({BitConverter.ToString(actual)}) differs from " +
+                     $"the template's ({BitConverter.ToString(expected)}). It can't be rewritten, " +
+                     "so if the charger rejects this tag, that may be why.");
+        }
+    }
+
+    private bool WritePage(TagSession session, byte page, byte[] value, string label)
+    {
+        var ok = TryWritePage(session.Transport, page, value, out var detail);
+        StepCompleted?.Invoke(this, new TagStepEventArgs(label, ok, ok ? "written" : detail));
+        return ok;
+    }
+
+    private static bool TryWritePage(ITagTransport transport, byte page, byte[] value, out string detail)
     {
         var apdu = NfcCommands.BuildUpdateBinary(page, value);
+        detail = "";
 
         // Writes are idempotent, so retry a couple of times: the tag can miss
         // an exchange if it is moved or the field is briefly disturbed.
@@ -174,10 +464,7 @@ public sealed class BumpGoTagPrepperService : IDisposable
             var transmitted = transport.TryTransmit(apdu, out var response);
 
             if (transmitted && NfcCommands.IsSuccess(response))
-            {
-                StepCompleted?.Invoke(this, new TagStepEventArgs(label, true, "written"));
                 return true;
-            }
 
             if (attempt < MaxWriteAttempts)
             {
@@ -185,14 +472,21 @@ public sealed class BumpGoTagPrepperService : IDisposable
                 continue;
             }
 
-            var detail = transmitted && response.Length > 0
+            detail = transmitted && response.Length > 0
                 ? $"reader returned {BitConverter.ToString(response)}"
                 : "no response from tag";
-            StepCompleted?.Invoke(this, new TagStepEventArgs(label, false, detail));
-            return false;
         }
 
         return false;
+    }
+
+    /// <summary>Per-tag state: the connection, and whether we've authenticated on it.</summary>
+    private sealed class TagSession
+    {
+        public TagSession(ITagTransport transport) => Transport = transport;
+
+        public ITagTransport Transport { get; }
+        public bool Authenticated { get; set; }
     }
 
     /// <summary>

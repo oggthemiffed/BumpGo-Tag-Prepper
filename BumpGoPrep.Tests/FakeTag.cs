@@ -39,6 +39,8 @@ internal sealed class FakeTag : ITagTransport
         return reply is not null;
     }
 
+    public bool TryReset() => true;
+
     public void Dispose() => Interlocked.Increment(ref _disposeCount);
 }
 

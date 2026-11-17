@@ -50,3 +50,16 @@ public sealed class LogEventArgs : EventArgs
     public string Message { get; }
     public LogEventArgs(string message) => Message = message;
 }
+
+/// <summary>Raised in <see cref="TagMode.Dump"/> once a tag's memory has been read.</summary>
+public sealed class TagReadEventArgs : EventArgs
+{
+    public string? Uid { get; }
+    public TagImage Image { get; }
+
+    public TagReadEventArgs(string? uid, TagImage image)
+    {
+        Uid = uid;
+        Image = image;
+    }
+}
